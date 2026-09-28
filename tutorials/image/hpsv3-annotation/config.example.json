@@ -1,0 +1,15 @@
+{
+  "input_run": "/path/to/curation-run",
+  "output": "/path/to/curation-run",
+  "schema_version": "1",
+  "hps_python": "/path/to/hpsv3-env/bin/python",
+  "checkpoint": "/path/to/HPSv3.safetensors",
+  "model_config": "/path/to/HPSv3_7B.yaml",
+  "replicas": 1,
+  "num_cpus": 20,
+  "num_gpus": 1,
+  "annotation_workers": 16,
+  "inference_batch_size": 16,
+  "max_model_batch_size": 256,
+  "batch_wait_ms": 50
+}

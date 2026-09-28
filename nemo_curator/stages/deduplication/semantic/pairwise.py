@@ -14,6 +14,7 @@
 
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal
@@ -83,6 +84,8 @@ def _resolve_compute_dtype(cluster_reps: "torch.Tensor", compute_dtype: Pairwise
 def pairwise_cosine_similarity_batched(
     cluster_reps: "torch.Tensor",
     batch_size: int = 1024,
+    candidate_threshold: float | None = None,
+    candidate_callback: Callable[[int, "torch.Tensor", "torch.Tensor", "torch.Tensor"], None] | None = None,
 ) -> tuple["cp.ndarray", "cp.ndarray"]:
     """Return each ranked row's most similar earlier row and its similarity.
 
@@ -180,6 +183,16 @@ def pairwise_cosine_similarity_batched(
             -torch.inf,
         )
 
+        if candidate_threshold is not None and candidate_callback is not None:
+            candidate_indices, query_offsets = torch.where(pairwise_sim_matrix >= candidate_threshold)
+            if candidate_indices.numel():
+                candidate_callback(
+                    start_idx,
+                    candidate_indices,
+                    query_offsets + start_idx,
+                    pairwise_sim_matrix[candidate_indices, query_offsets],
+                )
+
         max_values, batch_max_indices = torch.max(pairwise_sim_matrix, dim=0)
         if start_idx == 0:
             max_values[0] = 0.0
@@ -204,6 +217,8 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         read_kwargs: dict[str, Any] | None = None,
         write_kwargs: dict[str, Any] | None = None,
         compute_dtype: PairwiseComputeDtype = "float32",
+        candidate_pairs_output_path: str | None = None,
+        candidate_eps: float | None = None,
     ):
         """Initialize the pairwise cosine similarity stage.
 
@@ -227,6 +242,11 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
             msg = f"Unsupported compute_dtype: {compute_dtype}"
             raise ValueError(msg)
         self.compute_dtype = compute_dtype
+        if candidate_eps is not None and candidate_pairs_output_path is None:
+            msg = "candidate_pairs_output_path is required when candidate_eps is set"
+            raise ValueError(msg)
+        self.candidate_pairs_output_path = candidate_pairs_output_path
+        self.candidate_eps = candidate_eps
         self.ranking_strategy = ranking_strategy
         self.verbose = verbose
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
@@ -247,7 +267,7 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         rmm.mr.set_current_device_resource(self._rmm_memory_resource)
         torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
 
-    def process(self, task: FileGroupTask) -> FileGroupTask:  # noqa: PLR0915
+    def process(self, task: FileGroupTask) -> FileGroupTask:  # noqa: C901, PLR0915
         """Process a PairwiseFileGroupTask to compute pairwise similarities."""
         # TODO(NMCUR-457): Remove IdentifyDuplicatesStage's temporary Pairwise
         # metric propagation once core preserves every input across N-to-1 fan-in.
@@ -374,7 +394,31 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         # Compute pairwise similarities after any requested precision conversion.
         compute_start = time.perf_counter()
         resolved_batch_size = min(self.pairwise_batch_size, num_rows)
-        max_similarity, max_indices = pairwise_cosine_similarity_batched(cluster_embeddings, resolved_batch_size)
+
+        def write_candidate_batch(
+            start_idx: int,
+            candidate_indices: torch.Tensor,
+            query_indices: torch.Tensor,
+            scores: torch.Tensor,
+        ) -> None:
+            candidates = cudf.DataFrame(
+                {
+                    "id_a": ids.iloc[cp.asarray(query_indices)].reset_index(drop=True),
+                    "id_b": ids.iloc[cp.asarray(candidate_indices)].reset_index(drop=True),
+                    "cosine_sim_score": cudf.Series(cp.asarray(scores).astype(cp.float32)),
+                }
+            )
+            path = os.path.join(self.candidate_pairs_output_path, f"cluster_{cluster_id}_{start_idx:08d}.parquet")
+            self.write_parquet(
+                candidates, path, storage_options=self.output_storage_options, index=False, **self.write_kwargs
+            )
+
+        max_similarity, max_indices = pairwise_cosine_similarity_batched(
+            cluster_embeddings,
+            resolved_batch_size,
+            candidate_threshold=1.0 - self.candidate_eps if self.candidate_eps is not None else None,
+            candidate_callback=write_candidate_batch if self.candidate_eps is not None else None,
+        )
         # Finish the matrix multiplications before recording compute time and
         # returning their now-unused Torch workspace to the allocator.
         torch.cuda.synchronize()
@@ -451,6 +495,8 @@ class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
     sim_metric: Literal["cosine", "l2"] = "cosine"
     random_seed: int = 42
     compute_dtype: PairwiseComputeDtype = "float32"
+    candidate_pairs_output_path: str | None = None
+    candidate_eps: float | None = None
 
     def __post_init__(self):
         """Initialize parent class after dataclass initialization."""
@@ -497,5 +543,7 @@ class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
                 compute_dtype=self.compute_dtype,
                 read_kwargs=self.read_kwargs,
                 write_kwargs=self.write_kwargs,
+                candidate_pairs_output_path=self.candidate_pairs_output_path,
+                candidate_eps=self.candidate_eps,
             ),
         ]

@@ -1,0 +1,11 @@
+{
+  "input_run": "/path/to/curation-run",
+  "output": "/path/to/curation-run",
+  "schema_version": "1",
+  "model_dir": "/path/to/model_weights",
+  "num_cpus": 8,
+  "num_gpus": 1,
+  "annotation_workers": 4,
+  "num_gpus_per_worker": 0.25,
+  "model_inference_batch_size": 32
+}

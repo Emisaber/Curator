@@ -109,6 +109,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         # Pairwise precision (appended for positional compatibility)
         pairwise_compute_dtype: PairwiseComputeDtype = "float16",
         kmeans_embedding_output_dtype: KMeansEmbeddingOutputDtype = "float16",
+        candidate_eps: float | None = None,
     ):
         """
         Initialize the semantic deduplication workflow.
@@ -165,6 +166,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
 
         self.kmeans_output_path = os.path.join(self.cache_path, "kmeans_results")
         self.pairwise_output_path = os.path.join(self.cache_path, "pairwise_results")
+        self.candidate_pairs_output_path = os.path.join(self.cache_path, "candidate_pairs")
         self.duplicates_output_path = os.path.join(self.output_path, "duplicates")
 
         self.n_clusters = n_clusters
@@ -197,6 +199,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             raise ValueError(msg)
         self.pairwise_compute_dtype = pairwise_compute_dtype
         self.pairwise_batch_size = pairwise_batch_size
+        self.candidate_eps = candidate_eps
 
         # Duplicate identification parameters
         self.eps = eps
@@ -261,6 +264,8 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             create_or_overwrite_dir(self.output_path, storage_options=storage_options)
             create_or_overwrite_dir(self.kmeans_output_path, storage_options=storage_options)
             create_or_overwrite_dir(self.pairwise_output_path, storage_options=storage_options)
+            if self.candidate_eps is not None:
+                create_or_overwrite_dir(self.candidate_pairs_output_path, storage_options=storage_options)
             if self.eps is not None:
                 create_or_overwrite_dir(self.duplicates_output_path, storage_options=storage_options)
 
@@ -320,6 +325,8 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             ranking_strategy=self.ranking_strategy,
             compute_dtype=self.pairwise_compute_dtype,
             pairwise_batch_size=self.pairwise_batch_size,
+            candidate_pairs_output_path=self.candidate_pairs_output_path if self.candidate_eps is not None else None,
+            candidate_eps=self.candidate_eps,
             verbose=self.verbose,
             which_to_keep=self.which_to_keep,
             sim_metric=self.distance_metric,
@@ -352,6 +359,9 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         logger.info(f"Output path: {self.output_path}")
         logger.info(f"K-means output path: {self.kmeans_output_path}")
         logger.info(f"Pairwise output path: {self.pairwise_output_path}")
+        if self.candidate_eps is not None:
+            logger.info(f"Candidate pairs output path: {self.candidate_pairs_output_path}")
+            logger.info(f"Candidate threshold: {1.0 - self.candidate_eps}")
         if self.eps is not None:
             logger.info(f"Duplicates output path: {self.duplicates_output_path}")
             logger.info(f"Epsilon (similarity threshold): {self.eps}")

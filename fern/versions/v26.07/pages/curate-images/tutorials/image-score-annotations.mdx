@@ -1,0 +1,108 @@
+---
+description: "Annotate NSFW and HPSv3 scores after CLIP-caption checks across native image sources."
+categories: ["tutorials"]
+tags: ["image-curation", "quality-scoring"]
+difficulty: "intermediate"
+content_type: "tutorial"
+modality: "image-text"
+---
+
+# NSFW and HPSv3 annotations
+
+`tutorials/image/t2i-curation/run.py` runs CLIP-caption checks, optional VLM
+annotations, optional NSFW scoring, then optional HPSv3 scoring. Each stage
+finishes before the next begins. Scores annotate the decoded sample pool;
+these stages do not remove images or apply filtering thresholds.
+
+Use `config.example.json` for the complete workflow. Remove `nsfw` or `hpsv3`
+to disable that stage. The stages also run independently with their own
+`config.example.json` and a completed curation `input_run`.
+
+## Inputs and environments
+
+NSFW reads persisted `image_id` and CLIP embeddings. It reuses Curator's
+`NSFWScorer` in the existing Curator environment, without reading images or
+captions. The scorer requires the corresponding CLIP ViT-L/14 embeddings.
+
+HPSv3 reads existing decode Parquets and selects `status=ok`. Its CPU workers
+look up original captions and send source locations to a job-managed HTTP
+service. HTTP requests contain IDs, captions, and locations, not image pixels.
+There is no second decodable stage and no new per-image manifest.
+
+| Source | Image location sent to HPSv3 | Original caption |
+| --- | --- | --- |
+| BLIP3o Long / Short | TAR path, member offset, size when available | Selected `.txt` component through `.idx` |
+| VLV | Parquet path, original row index, pixel encoding and shape | Configured caption column |
+| Ego4D recaption | Existing frame TAR path, member offset and size | `comprehensive_description` joined through existing frame indices |
+
+The service reads TAR image bytes and decodes them with Pillow. When size is
+absent, it reads the TAR header immediately before the member's payload.
+VLV raw CHW uint8 pixels are restored directly; configured encoded images are
+decoded. Only row groups containing requested VLV rows are read. TAR scoring
+uses the orientation recorded by the decode stage, including stored-pixel
+orientation for the current pipeline.
+
+`hps_python`, `checkpoint`, and `model_config` configure the independent HPSv3
+environment and model. That environment must already have the model's
+dependencies, Pillow, NumPy, and PyArrow when using VLV. The service checks
+PyArrow at startup for VLV input. These entry points do not install packages.
+All replicas access the configured source storage paths.
+
+## Concurrency
+
+NSFW uses `annotation_workers`, `num_gpus_per_worker`, and
+`model_inference_batch_size`. HPSv3 uses CPU `annotation_workers`, each sending
+one request at a time containing up to `inference_batch_size` images. Requests
+are distributed by batch ID across `replicas`; each service dynamically batches
+requests up to `max_model_batch_size` with `batch_wait_ms` as its collection
+window. The services are started once and reused across sources. Ray reserves
+GPUs for services; GPU IDs are not hardcoded.
+
+## Outputs and recovery
+
+Results are stored under `annotations/nsfw/schema-v1/source=<name>/` and
+`annotations/hpsv3/schema-v1/source=<name>/`. Each root's `run.json` identifies
+all input sources and scoring settings. One input feature or decode Parquet
+corresponds to one output Parquet. Completed files are skipped before the input
+reader runs. A writer writes a temporary file and atomically replaces the
+result only after the partition has finished.
+
+Both stages use Curator checkpoints under `checkpoints/<stage>/schema-v1/`,
+separated by source. Resuming an interrupted partition recomputes that
+partition; already committed partitions are retained.
+
+NSFW rows contain `image_id`, `status`, `nsfw_score`, and `error`. Model runtime
+failures propagate, leaving an unfinished partition for a later resume.
+
+HPSv3 rows retain `image_id`, `caption_version`, `caption_sha256`, `status`,
+`score_mu`, `score_sigma`, and `error`. Original captions are never normalized
+for scoring. Empty captions are `skipped`; image decoding failures are
+`failed`; transient HTTP failures are `request_error`. Invalid client requests
+and response ID mismatches propagate rather than being silently accepted.
+
+To retry recorded failures after a run, add:
+
+```json
+"retry": {"pass": 1, "statuses": ["request_error", "failed"]}
+```
+
+The retry reads only output partitions containing those statuses and only
+rescores matching rows. Successful rows remain unchanged. Retry checkpoints
+are separate from the original run. There is no automatic retry loop.
+
+## Visual review
+
+The workflow writes `report-scores/index.html`, previews, and `summary.json`.
+It displays original captions, NSFW scores, HPSv3 score components, available
+VLM annotations, failures, and per-source counts. Low/middle/high examples
+and histograms come from a reproducible reservoir sample; aggregate counts,
+minimum, maximum, and means are computed across all persisted score rows.
+Caption hashes are checked before showing HPSv3 examples.
+
+To rebuild the static report independently:
+
+```bash
+python tutorials/image/t2i-curation/report.py \
+  --input-run /path/to/curation-run \
+  --output /path/to/curation-run/report-scores
+```

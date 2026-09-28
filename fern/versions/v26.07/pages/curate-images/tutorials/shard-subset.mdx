@@ -1,0 +1,209 @@
+---
+title: Shard subsets for caption-aware image deduplication
+---
+
+Select complete source shards before running CLIP-caption deduplication. This
+entry supports BLIP3o Long and Short WebDataset TARs, native VLV Parquet shards,
+and the existing Ego4D frame TARs with separate recaption results.
+
+## Prepare a subset
+
+Edit `tutorials/image/t2i-curation/config.subset.example.json` and run:
+
+```bash
+python tutorials/image/t2i-curation/prepare_subset.py \
+  --config /path/to/subset-input.json --output /path/to/subset
+```
+
+The output contains `config.json` and `shards.jsonl`. Each JSONL row records one
+selected shard; Ego4D rows also reference the existing frame manifest. No image
+or caption is read, copied, decoded, or repacked when selecting the subset.
+Source roots and annotation paths are configuration values; shard paths are
+relative to those roots.
+
+Each source's rate applies to its eligible shard count. Stable priorities based
+on the seed, source name, and relative path select
+`floor(eligible_shards * rate)` complete shards. A rate of one selects all eligible
+shards. Rates are independent and do not sum to one. Sources rounded to zero are
+recorded but do not enter the curation run. This is a shard fraction, not an exact
+image fraction. The Long example excludes filenames matching `*journeydb*` and
+`*_jdb_*`, case-insensitively, before sampling. Original files are preserved.
+
+## Read the selected inputs
+
+Edit `tutorials/image/caption-dedup/config.subset.example.json` and run:
+
+```bash
+python tutorials/image/caption-dedup/run.py --config /path/to/dedup.json
+```
+
+The entry reads only selected shards and processes sources sequentially. Workers
+within each source may run concurrently. `reader_workers`, `clip_workers`, and
+their GPU resource fractions are configurable; omitting worker counts uses the
+NeMo executor's sizing. `num_gpus` declares Ray resources, while the launch
+environment selects visible GPUs. Batch size defaults to 32 images for both the
+reader and CLIP inference. The fractions are scheduler requests, not GPU memory
+limits or a guarantee of even utilization.
+
+| Format | Image input | Caption lookup |
+| --- | --- | --- |
+| `webdataset_txt` | DALI reads selected TARs; a corrupt TAR retries through the CPU decodable reader | Candidate sample keys locate original TXT members through the TAR index |
+| `vlv_parquet` | Read native Parquet batches; restore raw CHW uint8 arrays, or decode encoded bytes when configured | Candidate original row positions select caption columns in the relevant row groups |
+| `ego4d_recaption` | Existing frame locations feed encoded bytes to DALI; a corrupt TAR retries selected members on CPU | Join the corresponding recaption result by the original `image_id`; use successful `comprehensive_description` values |
+
+VLV's `image_column`, `caption_column`, `image_encoding`, and `image_shape` are
+explicit. Confirm them against the local downloaded shard. The raw CHW example
+uses the 3 by 384 by 384 sample representation; it does not apply JPEG decoding to
+raw pixel bytes. VLV IDs use source, relative Parquet path, and original row index.
+
+Ego4D's `sample_index_root` and `annotations_root` point to one existing source
+partition and caption version. Its caption result filename follows the existing
+hash of the original manifest IDs. Original frame IDs, frame manifests, and
+caption results are unchanged. Frames without successful extraction and caption
+results are counted in logs and do not enter the usable T2I pool.
+
+## Decode checks before CLIP
+
+The reader records decode status while producing the existing `ImageBatch`
+input for CLIP. Normal TARs use DALI, with no additional CPU decode. The reader
+collects a complete TAR before returning its batches. If DALI reports a known
+image-content error, those partial results are discarded and the entire TAR is
+retried through the existing per-image CPU decode logic. Ego4D retries all
+selected members of its frame TAR. Valid images enter CLIP exactly once; invalid
+images are recorded and omitted. CUDA, memory, index, and file I/O failures
+propagate rather than becoming failed-image annotations.
+
+DALI 1.52 ignores EXIF orientation. TAR fallback uses the same stored pixel
+orientation; the standalone CPU decode stage retains its existing EXIF handling.
+Ego4D requests the configured `reader_gpus_per_worker` GPU fraction when CUDA is
+available. Raw VLV pixels use CPU array restoration without reserving a GPU.
+VLV null or malformed image rows fail individually while keeping all original
+row positions, so caption lookup remains aligned. The configured encoded-image
+branch is also retained.
+
+Decode output is `annotations/decode/schema-v1/run.json` and one
+`source=<name>/part-*.parquet` per shard. Rows contain `image_id`, `status`,
+`width`, `height`, `short_side_below_256`, `error`, and location fields (`shard`,
+`member`, `offset`, `size`, `row_index`). Fields not applicable to a source are
+null; the normal DALI TAR path supplies the member offset without separately
+looking up its byte size. The source name is supplied by the partition directory.
+Normal success, CPU fallback, and all-failed shards all write one final result;
+all-failed shards produce no CLIP batch. The short-side flag is an annotation,
+not an extra size filter.
+
+After every source's embeddings are written, one semantic workflow jointly
+clusters all source feature directories. It emits every candidate edge meeting
+the 0.99 threshold within a cluster, then compares normalized captions from the
+appropriate source. Original captions are preserved. The report supports all
+three input formats. This path does not precompute a new per-image input manifest.
+
+Outputs include `features/clip/schema-v1/source=<name>/`,
+`dedup/clip/schema-v1/{pairs,captions,cache}/`, and `report/`. These are feature,
+decision, and review artifacts, not copies of the subset's media.
+
+This entry checks CLIP similarity and caption relations without removing any
+samples. The resulting pairs are evidence for later selection, not a removal
+list. A `completed.json` is committed after caption checks succeed. Repeating
+the same completed run reuses its output; an interrupted deduplication run is
+not yet resumable within its clustering or pairwise computation. Existing
+partial outputs are preserved and reported as incomplete.
+
+## VLM annotation on the same subset
+
+The VLM entry accepts the existing subset without building a per-image manifest:
+
+```bash
+python tutorials/image/vlm-annotation/run.py --config /path/to/vlm.json
+```
+
+Use `tutorials/image/vlm-annotation/config.subset.example.json`. Its `subset`
+points to the directory containing `config.json` and `shards.jsonl`; source
+formats and paths come from that frozen subset. Alternatively, `sources` can
+provide a map of `CaptionSource` settings to process full source directories.
+The original single-TAR-source configuration remains supported.
+
+Sources run sequentially with one shared VLM server pool. Long and Short use
+the DALI reader with whole-TAR CPU fallback; VLV restores native pixel rows;
+Ego4D uses the existing frame indices and successful recaption records. Each
+reader emits `ImageBatch` objects with unchanged sample IDs. Only image pixels
+and the configured annotation prompt are sent to the VLM.
+
+Multi-source results use
+`annotations/vlm-basic/schema-v1/prompt-v2/source=<name>/part-*.parquet`,
+with shared source and prompt settings in `run.json`. Checkpoints are separate
+for each source under `checkpoints/vlm-basic/schema-v1/prompt-v2/source=<name>/`.
+Existing completed annotation Parquets are skipped on resume. Configure
+`retry: {"pass": 1, "statuses": ["length", "request_error", "invalid_response"]}`
+to retry the selected failure rows in their original batches; each retry pass
+uses a separate checkpoint and preserves other rows.
+
+`batch_size` controls reader image batches, `reader_workers` controls readers,
+and `annotation_workers` / `requests_per_worker` control request concurrency.
+The independent vLLM environment, model path, replica count, and engine options
+remain configurable through `inference_server`.
+
+Generate the static report from completed results with:
+
+```bash
+python tutorials/image/vlm-annotation/report.py \
+  --annotations /path/to/run/annotations/vlm-basic/schema-v1/prompt-v2 \
+  --report /path/to/run/report/vlm
+```
+
+The report supports TAR images and native VLV Parquet images, including failure
+examples.
+
+## Sequential CLIP checks and VLM annotation
+
+Use `tutorials/image/t2i-curation/config.dedup-vlm.example.json` to run the
+current subset through CLIP-caption checks and then VLM annotation:
+
+```bash
+python tutorials/image/t2i-curation/run.py --config /path/to/workflow.json
+```
+
+The `subset` is an already prepared shard subset directory. The workflow does
+not sample images, regenerate captions, or remove duplicate candidates. The
+`dedup` and `vlm` objects retain their own worker, batch, GPU, and model settings.
+Once all source embeddings, clustering, pairwise scores, and caption checks
+succeed, the workflow launches one multi-source VLM entry. The managed VLM
+services start once and remain available while sources are processed in order.
+
+VLM receives `input_run`, pointing to the completed CLIP run, rather than a
+second subset or a per-image manifest. Standalone use of this input is shown
+in `tutorials/image/vlm-annotation/config.input-run.example.json`. Source
+settings come from the upstream `run.json`. Each reader task consumes one
+upstream `annotations/decode/schema-v1/source=<name>/part-*.parquet` and reads
+only its `status=ok` samples. Noncandidate images and both endpoints of similar
+pairs are included. Upstream decode files are never rewritten.
+
+Normal Long/Short TARs retain the WebDataset DALI reader. For a TAR containing
+known decode failures, only its successful indexed members are reread using
+the existing CPU decoder. VLV reads the original successful row positions;
+Ego4D decodes the successful frame locations through DALI without rereading
+recaption annotations. A previously successful sample that can no longer be
+read raises a read failure instead of silently disappearing. Batch ordering
+follows the upstream records, with a configurable default batch size of 32.
+
+VLM output remains one annotation row per image in
+`annotations/vlm-basic/schema-v1/prompt-v2/source=<name>/part-*.parquet`.
+Rows include sample identity and location, model and prompt identity, raw
+response, error, status, and exactly the configured annotation columns.
+Statuses are `ok`, `request_error`, `length`, and `invalid_response`. No caption
+is sent to the VLM. The prompt, output schema, request distribution, writer,
+and failure-retry mechanism are unchanged.
+
+Restarting the workflow after VLM interruption skips completed CLIP checks
+and uses the VLM source checkpoints and existing batch Parquets. A changed
+batch size cannot reuse the same annotation output. Use VLM's `retry` object
+to select failure statuses; retry input resolves back to the original decode
+partitions and uses separate retry checkpoints.
+
+Dedup reports are generated separately so report construction does not block
+annotation. Once the run is complete, use
+`python tutorials/image/caption-dedup/run.py --config /path/to/run/configs/dedup.json --no-skip-report`.
+This reuses the completed dedup output and generates `report/index.html` without
+recomputing embeddings or similarity. VLM report generation uses the command
+above. Actual duplicate selection based on clarity is deferred until annotations
+are available. NSFW and HPSv3 entry implementations are outside this integration;
+their older manifest-based workflow paths still require separate adaptation.

@@ -1,0 +1,16 @@
+{
+  "data_root": "/path/to/ego4d",
+  "output": "/path/to/ego4d-recaption",
+  "sources": ["fho", "narration"],
+  "caption_version": "v1",
+  "base_url": "http://127.0.0.1:8000/v1",
+  "batch_size": 64,
+  "extraction_workers": 4,
+  "caption_workers": 8,
+  "requests_per_worker": 8,
+  "max_image_edge": 1024,
+  "max_output_tokens": 2048,
+  "num_cpus": 16,
+  "num_gpus": 0,
+  "retry_failed": false
+}

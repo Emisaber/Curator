@@ -1,0 +1,27 @@
+{
+  "source": {
+    "name": "blip3o_long",
+    "root": "/path/to/blip3o-long-tars",
+    "index_suffix": ".idx"
+  },
+  "output": "/path/to/experiment",
+  "version": "v1",
+  "fields": [
+    "visual_quality",
+    "clarity",
+    "exposure",
+    "color_cast",
+    "rendered_text",
+    "text_coverage",
+    "watermark",
+    "logo",
+    "visible_artifacts",
+    "scene_type"
+  ],
+  "base_url": "http://127.0.0.1:8000/v1",
+  "max_shards": 1,
+  "max_images_per_partition": 8,
+  "batch_size": 8,
+  "num_cpus": 4,
+  "num_gpus": 1
+}

@@ -126,6 +126,24 @@ class TestPairwiseCosineSimilarityBatched:
         np.testing.assert_array_equal(max_indices.tolist(), [0, 0])
         np.testing.assert_allclose(max_similarity.tolist(), [0.0, -1.0])
 
+    def test_candidate_callback_returns_all_thresholded_edges(self) -> None:
+        embeddings = torch.tensor(
+            [[1.0, 0.0], [0.999, 0.0447], [0.998, 0.0632]], device="cuda"
+        )
+        embeddings = embeddings / torch.linalg.vector_norm(embeddings, dim=1, keepdim=True)
+        edges = []
+
+        def collect(
+            _start_idx: int, candidate_indices: torch.Tensor, query_indices: torch.Tensor, scores: torch.Tensor
+        ) -> None:
+            edges.extend(zip(query_indices.tolist(), candidate_indices.tolist(), scores.tolist(), strict=True))
+
+        pairwise_cosine_similarity_batched(
+            embeddings, batch_size=2, candidate_threshold=0.995, candidate_callback=collect
+        )
+
+        assert {(query, candidate) for query, candidate, _ in edges} == {(1, 0), (2, 0), (2, 1)}
+
     def test_cuda_input_contract(self) -> None:
         with pytest.raises(ValueError, match="CUDA tensor"):
             pairwise_cosine_similarity_batched(torch.empty((0, 2)), 2)
@@ -318,6 +336,36 @@ class TestPairwiseCosineSimilarityStage:
             "pairwise_write_time",
         }
         assert all(metrics[name] >= 0 for name in metrics if name.endswith("_time"))
+
+    def test_candidate_files_contain_every_image_edge(self, tmp_path: Path) -> None:
+        embeddings = cp.asarray([[1.0, 0.0], [0.999, 0.0447], [0.998, 0.0632]], dtype=cp.float32)
+        embeddings /= cp.linalg.norm(embeddings, axis=1, keepdims=True)
+        frame = cudf.DataFrame({"id": ["a", "b", "c"], "rank": [0, 1, 2]})
+        frame["embedding"] = create_list_series_from_1d_or_2d_ar(embeddings, index=frame.index)
+        input_file = tmp_path / "embeddings.parquet"
+        frame.to_parquet(input_file)
+        candidates = tmp_path / "candidates"
+        stage = PairwiseCosineSimilarityStage(
+            id_field="id",
+            embedding_field="embedding",
+            output_path=str(tmp_path / "pairwise"),
+            ranking_strategy=RankingStrategy.metadata_based(["rank"], ascending=True),
+            pairwise_batch_size=2,
+            candidate_pairs_output_path=str(candidates),
+            candidate_eps=0.005,
+        )
+        task = FileGroupTask(
+            dataset_name="test", data=[str(input_file)], _metadata={"centroid_id": 3, "filetype": "parquet"}
+        )
+
+        stage.process(task)
+
+        files = sorted(candidates.glob("*.parquet"))
+        assert files
+        pairs = cudf.concat([cudf.read_parquet(path) for path in files], ignore_index=True)
+        observed = {frozenset((row.id_a, row.id_b)) for row in pairs.to_pandas().itertuples()}
+        assert observed == {frozenset(("a", "b")), frozenset(("a", "c")), frozenset(("b", "c"))}
+        assert (pairs["cosine_sim_score"] >= 0.995).all()
 
     def test_pairwise_stage_with_custom_metadata_ranking(self, tmp_path: Path) -> None:
         """Test PairwiseCosineSimilarityStage with custom metadata-based ranking."""

@@ -1,0 +1,176 @@
+---
+description: "Compare pHash and native CLIP semantic deduplication on a small sample of local image TARs."
+categories: ["tutorials"]
+tags: ["image-curation", "deduplication"]
+difficulty: "intermediate"
+content_type: "tutorial"
+modality: "image-only"
+---
+
+# Compare image deduplication candidates
+
+This experiment reads existing, **uncompressed local TAR shards**. It does not download
+datasets or rewrite source images. It records decode failures, pHash candidates, and
+the native CLIP workflow's proposed duplicate IDs, then exports a portable HTML review.
+
+The entry point is `tutorials/image/dedup-comparison/run.py`. It uses standard Curator
+stages and the default Xenna executor. New deduplication code consists of three stages:
+
+| Stage | Input → output | Work |
+| --- | --- | --- |
+| `TarImageDecodeStage` | `DocumentBatch → ImageBatch` | Read indexed TAR members, apply EXIF orientation, decode RGB, record errors |
+| `PerceptualHashStage` | `ImageBatch → ImageBatch` | Add a 64-bit pHash to each image's metadata |
+| `PhashCandidateStage` | `FileGroupTask → FileGroupTask` | Compare hashes across all feature files, write candidate pairs |
+
+`ImageBlurFilterStage` scores each decoded RGB image with the same Laplacian
+variance formula as the interleaved blur filter. It records `laplacian_variance`
+and `is_blurry` in image metadata. The default threshold is 100; the runner's
+`--blur-threshold` changes the marker without removing images.
+
+The feature pipeline reuses `ParquetReader`, `ImageEmbeddingStage`,
+`ConvertImageBatchToDocumentBatchStage`, and `ParquetWriter`. CLIP deduplication
+reuses `SemanticDeduplicationWorkflow`. It does **not** run `ImageDuplicatesRemovalStage`.
+
+## Environment and execution
+
+Use an existing editable Curator environment with the image dependencies. pHash
+requires `ImageHash>=4.3,<5`, included in `image_cpu`. CLIP deduplication additionally
+requires the native CUDA/RAPIDS semantic-dedup dependencies and CLIP weights.
+Laplacian scoring requires the optional `cv2` extra (`opencv-python-headless`).
+
+A CPU-only first run:
+
+```bash
+python tutorials/image/dedup-comparison/run.py \
+  --source long=/data/blip3o-long short=/data/blip3o-short \
+  --output /data/experiments/dedup-phash-001 \
+  --mode phash
+```
+
+For both methods, set `CUDA_VISIBLE_DEVICES` to the GPUs selected **at launch time**,
+then run:
+
+```bash
+python tutorials/image/dedup-comparison/run.py \
+  --source long=/data/blip3o-long short=/data/blip3o-short \
+  --output /data/experiments/dedup-both-001 \
+  --mode both \
+  --model-dir /data/models \
+  --num-cpus 8 --num-gpus 1
+```
+
+`--num-gpus` is a Ray resource count, not a physical device number. The feature
+pipeline uses one CLIP worker; native deduplication may use the available Ray GPUs.
+When `RAY_ADDRESS` is set, Curator connects to that existing cluster: its resource
+configuration takes precedence over the local startup counts. For an isolated
+experiment, launch without `RAY_ADDRESS`. GPU selection must be applied when that
+cluster starts.
+
+`--model-dir` is the cache root; the native model uses
+`openai/clip-vit-large-patch14` beneath it and downloads missing weights through
+Curator's existing model setup. No server paths or GPU indices are stored in source.
+
+If the shell's file-descriptor limit is too low for Ray, raise its soft limit
+before starting the process, within the container's hard limit. See `ulimit -Sn`
+and `ulimit -Hn`; this experiment does not change system limits.
+
+## Sampling and method settings
+
+- Each source can be assigned an independent sampling fraction with
+  `--source-sample-rate NAME=RATE`. A rate of `0.1` selects 10% of that source;
+  omitting the option selects every record. The rates do not need to sum to one;
+  they directly control the resulting source distribution.
+- Stable hash priorities perform reproducible sampling without replacement across
+  all TAR shards in each source.
+- Each manifest has at most 32 records. The reader seeks directly to TAR offsets;
+  it neither decodes a whole shard at once nor unpacks the dataset.
+- An image ID identifies an occurrence: source name, relative shard path, member
+  name, and byte offset. Moving the dataset mount does not change IDs; repacking
+  shards does. Copies in different sources remain distinct records for deduplication.
+- pHash: ImageHash DCT hash, 8 × 8 bits, Hamming distance ≤ 6. These are experimental
+  settings, **not NeMo defaults**. Save distances through 8 for boundary inspection.
+- CLIP: the official image example's `eps=0.01` (cosine ≥ 0.99) and 100 clusters.
+  Keep the workflow's default hard ranking, float16 embedding storage and float16
+  pairwise computation. The workflow API itself defaults to `eps=None`; the image
+  example explicitly supplies 0.01, as this runner does.
+- At least `--n-clusters` successfully decoded images are needed for clustering.
+  `--n-clusters` can be reduced for a tiny functional test; record that difference
+  when interpreting the result.
+
+pHash compares all pairs in blocks, including records in different feature files.
+It is quadratic and intended for small experiments. CLIP follows NeMo's clustered,
+ranked comparison: it records each image's best preceding candidate in its cluster.
+It is **not** an exhaustive list of all image pairs above 0.99.
+
+## Outputs and inspection
+
+The output directory must be new. All data stays under it:
+
+| Path | Content |
+| --- | --- |
+| `samples/schema-v1/` | Stable sample table and source-partitioned manifests |
+| `annotations/decode/schema-v1/` | Decode status, dimensions and original TAR location |
+| `features/clip/schema-v1/` | Image IDs, provenance, Laplacian scores, blur flags, pHash and/or embeddings |
+| `dedup/clip/schema-v1/cache/` | Native clustering and pairwise output |
+| `dedup/clip/schema-v1/duplicates/` | Native proposed duplicate IDs; source files are untouched |
+| `run.json` | Parameters, package versions and timings |
+| `report/` | HTML, original image copies, previews, candidate table and statistics |
+
+Copy the entire `report/` directory to a local machine and open `index.html`;
+no web service is required. The default review budget is 200 unique pairs:
+60 random pHash hits, 60 random CLIP hits, 20 from each disagreement direction,
+and 20 from each boundary set. Overlaps retain their cohort labels. Missing or
+overlapping slots are filled with extra candidates; the actual total may be lower.
+
+Click images for the originals, switch to 100% for clarity comparison, and label
+image relationship and relative clarity separately. Algorithm scores are initially
+collapsed. Browser storage keeps labels locally; export JSON to preserve them
+outside the browser or import them on another machine.
+
+Native CLIP scores determine the CLIP matched flag. For a pHash candidate absent
+from the saved native CLIP candidates, the report can show a supplemental float32
+dot product from the saved embeddings. That number is diagnostic only: it does not
+change the native decision. An absent CLIP candidate can reflect clustering,
+rank order or threshold selection, not just a low global similarity.
+
+An arrow `id → max_id` preserves the native candidate direction. `max_id` may itself
+be marked duplicate elsewhere; it is not necessarily the final survivor. No clarity
+score is used to choose survivors in this experiment.
+
+Use the random-hit cohorts separately to evaluate precision. Disagreements and
+boundary cases are deliberately selected and must not be pooled into an overall
+accuracy estimate. Candidate-only review does not measure recall. These synthetic
+functional tests also do not establish performance on BLIP3o.
+
+To regenerate only the report:
+
+```bash
+python tutorials/image/dedup-comparison/report.py \
+  --output /data/experiments/dedup-both-001 --pairs 200 --seed 42
+```
+
+This iteration does not implement caption merging, deletion, sampling weights or
+persistent pipeline recovery. Original TARs and output tables retain the provenance
+needed for later annotation and selection stages.
+
+## Verification
+
+In the existing Curator environment:
+
+```bash
+python -m pytest -q -m 'not gpu' \
+  tests/stages/image/io/test_tar_image_reader.py \
+  tests/stages/image/deduplication \
+  tests/stages/image/filters/test_blur_filter.py \
+  tests/tutorials/image/dedup_comparison
+```
+
+The CPU integration test runs a real Xenna pipeline on tiny TAR fixtures, including
+duplicate pixels, blur variants and corrupt members. It also checks that exported
+originals exactly match the corresponding TAR bytes.
+
+The separate `test_run_gpu.py` test is opt-in. It requires
+`CURATOR_IMAGE_MODEL_DIR`, uses the real CLIP model and native RAPIDS workflow,
+and compares proposed duplicate IDs against the saved native scores at 0.99.
+Run it only after selecting the GPU allocation for the Ray cluster. Its two-cluster
+fixture checks integration, not BLIP3o quality or production throughput.

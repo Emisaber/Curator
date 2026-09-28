@@ -1,0 +1,96 @@
+---
+description: "当前 T2I 数据管线的阶段、代码位置、并发和运行方式。"
+categories: ["tutorials"]
+tags: ["image-curation", "pipeline"]
+difficulty: "intermediate"
+content_type: "tutorial"
+modality: "image-text"
+---
+
+# T2I 数据管线
+
+本文对应当前 worktree 中的实现。它从已准备好的图片来源生成解码记录、CLIP 相似候选和可选标注，供后续人工检查与筛选。**当前总入口不按分数删除图片，也不生成最终训练数据池。**
+
+## 架构与数据流
+
+`tutorials/image/t2i-curation/run.py` 是总入口。它读取一份 JSON 配置，用子进程依次调用去重、VLM、NSFW 和 HPSv3 的独立入口。每个入口有自己的 Curator `Pipeline`、Ray 生命周期和落盘结果；前一入口结束后，下一入口才启动。单个 Curator pipeline 内部仍由 executor 并行处理任务。
+
+```text
+来源文件 ── 可选的分片 subset ── 按来源读取与解码检查 ── CLIP 特征
+                                                        │
+                    跨来源 KMeans → 相似图片对 → 命中对的 caption 核查
+                                                        │
+                      完成标记 → 可选 VLM → 可选 NSFW → 可选 HPSv3
+                                               └───────────┬─────────┘
+                                                       可选评分报告
+```
+
+总入口的 VLM、NSFW、HPSv3 阶段由配置中的同名顶层键控制，顺序固定。它们读取已落盘的上游结果，不直接接收上一个入口内存中的 `ImageBatch`。去重阶段只标记图片相似关系和 caption 关系；后续阶段仍处理通过解码检查的图片，不按去重候选名单移除图片。
+
+支持的来源格式是 WebDataset TAR 的 `.jpg`/`.jpeg`/`.png`/`.webp` 与 `.txt`、带外部 caption 引用的 TAR/Parquet、LAION VLV Parquet，以及 Ego4D recaption 产出的帧 TAR。`CaptionSource` 描述各来源的根目录和读取规则。Ego4D 抽帧与 recaption 由 `tutorials/image/ego4d-recaption/run.py` **事先独立运行**；总入口不会自动启动它。
+
+## 阶段与代码索引
+
+以下路径均相对于仓库根目录。
+
+| 阶段 | 主要行为与落盘结果 | 代码入口与关键实现 |
+| --- | --- | --- |
+| 分片子集（可选） | 按来源、按配置比例选 TAR/Parquet 分片；保存选中的分片清单，不逐图复制媒体或生成 caption。Long 的 JourneyDB 排除规则在此生效。 | `tutorials/image/t2i-curation/prepare_subset.py`；`nemo_curator/stages/image/io/subset.py` 的 `prepare_subset`、`load_subset` |
+| 读取与可解码检查 | TAR 正常走 DALI；明确的图片解码错误使当前 TAR 回退到逐图 CPU 检查，好图仍进入 CLIP。VLV 按原始行号还原像素；Ego4D 帧按已有索引读取。写 `annotations/decode/schema-v1/source=<name>/*.parquet`，状态为 `ok` 或 `failed`。 | `tutorials/image/caption-dedup/run.py` 的 `create_embedding_pipeline`；`nemo_curator/stages/image/io/decodable_reader.py` 的 `DecodableImageReaderStage`；`source_reader.py` 的 `SourceShardReaderStage` |
+| CLIP 特征与相似候选 | 每个来源先单独读图、计算并写出 CLIP 特征；随后把所有来源的特征目录同时交给 `SemanticDeduplicationWorkflow`，因此可以产生跨来源候选。KMeans 分簇后做簇内相似比较；候选阈值由入口固定为 `candidate_eps=0.01`，即余弦相似度至少 `0.99`。 | `tutorials/image/caption-dedup/run.py`；`nemo_curator/stages/image/embedders/clip_embedder.py`；`nemo_curator/stages/deduplication/semantic/workflow.py`、`pairwise.py` |
+| 命中对的 caption 核查 | 只回查相似候选涉及的原始 caption；比较时做 NFC 与空白归一化，原文仍保留。每条候选边标记 `same_caption`、`different_caption` 或 `missing_caption`，写入去重目录下的 `pairs/` 和 `captions/`；不物理删图。 | `nemo_curator/stages/image/deduplication/caption.py` 的 `CaptionAwareDeduplicationStage`；`nemo_curator/stages/image/io/caption_lookup.py` |
+| 基础 VLM 标注（可选） | 从解码检查记录重新读取成功图片；按 `fields` 生成提示词及 JSON Schema，调用配置的 vLLM 服务，写原始回答、字段、状态与错误。当前不重写 caption。 | `tutorials/image/vlm-annotation/run.py`；`nemo_curator/stages/image/io/decoded_image_reader.py`；`nemo_curator/stages/image/annotation/vlm.py` 的 `ImageVLMAnnotationStage` |
+| NSFW（可选） | 直接读取已有 CLIP 特征，用 Curator 的 NSFW 模型评分，写 `annotations/nsfw/schema-v1/source=<name>/*.parquet`；不重新读图，也不设筛选阈值。 | `tutorials/image/nsfw-annotation/run.py`；`nemo_curator/stages/image/annotation/nsfw.py` |
+| HPSv3（可选） | 读取解码成功记录，回查**原始 caption**，把图片位置和文本交给独立模型服务评分。服务按 TAR 偏移或 VLV 原始行号读取图片；HTTP 不传原始像素。写 `annotations/hpsv3/schema-v1/source=<name>/*.parquet`。 | `tutorials/image/hpsv3-annotation/run.py`；`nemo_curator/stages/image/annotation/hpsv3_annotation.py`、`hpsv3_service.py`、`hpsv3_server.py` |
+| 静态检查报告（可选） | 启用 NSFW 或 HPSv3 时，总入口在结束后生成 `report-scores/index.html` 和 `summary.json`，汇总状态、分数与少量图片样例。直方图基于报告抽样，不能当作全量分布。 | `tutorials/image/t2i-curation/report.py` |
+
+独立的 pHash/CLIP 对比实验位于 `tutorials/image/dedup-comparison/`；pHash **不在上述总入口中**。
+
+## 执行与恢复边界
+
+去重入口按来源依次运行读取和 CLIP 特征 pipeline，然后运行一次跨来源聚类、相似比较和 caption 核查。使用 subset 时，特征位于 `features/clip/schema-v1/source=<name>/`，完成标记位于 `dedup/clip/schema-v1/completed.json`；不使用 subset 时，对应路径为 `dedup/clip/v1/cache/features/<name>/` 和 `dedup/clip/v1/completed.json`。总入口的后续阶段以该完成标记为前置条件。当前去重入口**不支持未完成运行的阶段内恢复**：仅有中间 Parquet 不等于整个去重阶段完成，不应把部分结果当作完成的数据池。
+
+VLM、NSFW、HPSv3 按输入分片写 Parquet，并使用各自的 checkpoint 目录。再次执行时，它们按已完成的结果文件跳过输入；VLM 和 HPSv3 可以配置独立的 `retry` pass，只重做指定失败状态，保留成功行。VLM 的提示词哈希、字段等设置记录在对应的 `run.json` 中；含义变化时使用新的输出／提示词版本，不混用旧标注。`nemo_curator/stages/image/annotation/file_utils.py` 提供 NSFW/HPSv3 共用的分片选择与配置一致性检查。
+
+## 并发与资源
+
+外层总入口是**串行阶段**；并发发生在每个阶段内部。`num_cpus`、`num_gpus` 是该入口启动的 Ray 集群资源声明，**不指定物理 GPU 编号**。使用 `CUDA_VISIBLE_DEVICES` 在启动命令的环境中选择可见设备。
+
+| 配置 | 作用 |
+| --- | --- |
+| `dedup.reader_workers`、`dedup.clip_workers` | 每个来源的读图 actor 和 CLIP actor 数。`reader_gpus_per_worker`、`clip_gpus_per_worker` 是各 actor 的 GPU 资源请求。`batch_size` 同时用于读取与 CLIP 推理批次。 |
+| `dedup.n_clusters` | KMeans 的簇数，不是 worker 数。聚类、相似比较由 `SemanticDeduplicationWorkflow` 的后端调度，不能用 `clip_workers` 推断它们的并发。 |
+| `vlm.inference_server.num_replicas` | 托管 vLLM 副本数。每副本由 Ray 预留 GPU，vLLM 使用 `inference_server.environment` 指定的**独立环境**启动。`engine_kwargs` 传入 vLLM；没有 `inference_server` 时可连接外部 OpenAI 兼容服务。 |
+| `vlm.annotation_workers`、`vlm.requests_per_worker` | 标注 actor 数及单 actor 内并发 HTTP 请求数；后者由线程池实现。有效请求量还受图片读取、队列和服务容量限制，不能只把两个数相乘当作实际吞吐。 |
+| `nsfw.annotation_workers`、`nsfw.num_gpus_per_worker` | 对已存 CLIP 特征并行评分的 actor 数和每 actor 的 GPU 请求；`model_inference_batch_size` 是单 actor 推理批次。 |
+| `hpsv3.replicas`、`hpsv3.annotation_workers` | 独立 HPSv3 服务副本数和向服务发请求的 CPU actor 数。每个服务副本预留 1 张 GPU；`inference_batch_size` 是单次 HTTP 请求条数，`max_model_batch_size`、`batch_wait_ms` 控制服务侧合批。 |
+
+这些值是配置上限或资源请求，不是实际同时运行的进程数；实际分配取决于可用 CPU/GPU、输入分片和 Ray 调度。特别是 HPSv3 模型服务与 HPSv3 标注 actor 属于不同进程，不能把 `annotation_workers` 当作模型副本数。
+
+## CLIP 去重的进程残留
+
+两次完成的真实流程测试都观察到 GPU 0 多出约 1.4 GiB 显存。进程归属核对到 `PairwiseCosineSimilarityStage` 的 Ray worker，而非 CLIP 特征模型或 VLM 服务；该 stage 的 `setup()` 创建初始 1 GB 的 RMM 显存池。第二次测试中，Ray core-worker 日志已记录关闭完成，但操作系统进程仍存活、持有 GPU 设备句柄；普通 `SIGTERM` 未使它退出，定向结束已确认的孤儿进程后显存才回到基线。
+
+`tutorials/image/caption-dedup/run.py` 已在 `finally` 中调用 `RayClient.stop()`；当前 `nemo_curator/core/client.py` 的 `stop()` 终止集群启动进程组并等待启动进程，**不保证逐个 worker 已退出**。不能仅凭 pipeline 成功退出或 `ray.shutdown()` 就认定显存已释放。worker 卡在进程退出哪一层尚未查明，也不能仅凭 1 GB 显存池认定其析构是根因。此问题尚未在代码中修复。
+
+运行前后应记录各 GPU 显存；如出现残留，核对 `nvidia-smi` PID、容器 PID、启动时间与本次 Ray 会话，再对**已确认属于本次运行**的进程定向处理。不要全局 `ray stop` 或按 GPU 批量结束进程。
+
+## 配置与启动
+
+仓库已有两份可直接改路径的示例：`tutorials/image/t2i-curation/config.subset.example.json` 定义来源和分片抽样比例；`config.example.json` 定义总入口及可选阶段。Long 排除 JourneyDB 要通过前者生成 subset；只把 `exclude_patterns` 写进来源配置、却绕过 subset，不会执行该分片筛选。未使用 subset 时，总入口接受顶层 `sources`。
+
+在已配置 NeMo Curator 的环境中，从仓库根目录运行：
+
+```bash
+python tutorials/image/t2i-curation/prepare_subset.py \
+  --config /path/to/subset-config.json \
+  --output /path/to/subset
+
+GPU_IDS=0,1,2,3  # 示例；改为本次分配的 GPU
+CUDA_VISIBLE_DEVICES="$GPU_IDS" python tutorials/image/t2i-curation/run.py \
+  --config /path/to/workflow-config.json
+```
+
+`workflow-config.json` 的 `subset` 指向第一条命令的输出目录，`output` 指向本次运行目录。根据需要保留或删除顶层 `vlm`、`nsfw`、`hpsv3` 键。VLM 托管服务还需要填写独立 vLLM 环境、模型路径、副本数和 `engine_kwargs`；HPSv3 需要填写独立 `hps_python`、权重和配置路径。路径均由配置给出，代码不固定 GPU 编号或模型目录。已有服务也可通过 VLM 独立入口的 `base_url` 配置连接；总入口传递同一 `vlm` 配置。
+
+正常运行的关键信息位于 `<output>/configs/`（各阶段实际配置）、`<output>/run.json`、`<output>/dedup/clip/schema-v1/completed.json`、各阶段 `annotations/`、`checkpoints/` 和 `logs/`。如果只需单独重跑某个可选阶段，可用其对应的 `tutorials/image/*-annotation/run.py --config ...`，并让 `input_run` 指向已完成的去重运行。先核对输出目录中已有的 `run.json` 和失败状态，再决定复用目录或新建运行。

@@ -1,0 +1,45 @@
+{
+  "seed": 42,
+  "sources": {
+    "blip3o_long": {
+      "root": "/path/to/blip3o-long",
+      "format": "webdataset_txt",
+      "index_suffix": ".idx",
+      "exclude_patterns": ["*journeydb*", "*_jdb_*"]
+    },
+    "blip3o_short": {
+      "root": "/path/to/blip3o-short",
+      "format": "webdataset_txt",
+      "index_suffix": ".idx"
+    },
+    "laion_vlv": {
+      "root": "/path/to/laion-6m-vlv",
+      "format": "vlv_parquet",
+      "image_column": "image",
+      "caption_column": "caption",
+      "image_encoding": "raw_chw_uint8",
+      "image_shape": [3, 384, 384]
+    },
+    "ego4d-fho": {
+      "root": "/path/to/recaption/media/source=ego4d-fho",
+      "format": "ego4d_recaption",
+      "sample_index_root": "/path/to/recaption/samples/schema-v1/manifests/source=ego4d-fho",
+      "annotations_root": "/path/to/recaption/annotations/recaption/schema-v1/prompt-v1/source=ego4d-fho"
+    },
+    "ego4d-narration": {
+      "root": "/path/to/recaption/media/source=ego4d-narration",
+      "format": "ego4d_recaption",
+      "sample_index_root": "/path/to/recaption/samples/schema-v1/manifests/source=ego4d-narration",
+      "annotations_root": "/path/to/recaption/annotations/recaption/schema-v1/prompt-v1/source=ego4d-narration"
+    }
+  },
+  "subset": {
+    "source_sample_rates": {
+      "blip3o_long": 0.1,
+      "blip3o_short": 0.1,
+      "laion_vlv": 0.1,
+      "ego4d-fho": 1.0,
+      "ego4d-narration": 1.0
+    }
+  }
+}

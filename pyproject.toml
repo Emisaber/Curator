@@ -144,6 +144,7 @@ audio_cuda12 = [
 
 image_cpu = [
     "Pillow",
+    "ImageHash>=4.3,<5",
     "torchvision"
 ]
 

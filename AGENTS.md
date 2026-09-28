@@ -3,6 +3,24 @@
 NeMo Curator is a scalable library for preparing multimodal datasets. Pipelines
 are composed of `ProcessingStage` objects executed by a backend (Ray Data, Xenna, Ray Actor Pool) over streams of `Task` objects.
 
+## Code edit authorization
+
+Do not modify source code, tests, scripts, or dependency files unless the user
+explicitly requests the specific implementation or fix. Treat requests to
+explain, research, plan, review, or verify as read-only. Do not resume code
+edits merely because earlier implementation work was in progress.
+
+## Implementation style and scope
+
+- Strictly follow the existing repository's code style and conventions.
+- Implement the agreed design and scope. Do not add unrequested behavior or
+  change other stages.
+- Keep code readable and maintainable. Prefer existing abstractions and direct
+  implementations over additional frameworks or layers.
+- Do not overengineer, overcomplicate, or add excessive defensive programming.
+- If the implementation requires changing the agreed design, explain the
+  concrete reason and obtain the user's agreement before making that change.
+
 ## Core abstractions
 
 | Abstraction | Location | Role |

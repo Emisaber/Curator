@@ -1,0 +1,15 @@
+{
+  "subset": "/path/to/subset",
+  "output": "/path/to/new-curation-run",
+  "model_dir": "/path/to/clip-models",
+  "num_cpus": 80,
+  "num_gpus": 4,
+  "reader_workers": 8,
+  "reader_gpus_per_worker": 0.25,
+  "clip_workers": 8,
+  "clip_gpus_per_worker": 0.25,
+  "batch_size": 32,
+  "n_clusters": 100,
+  "review_pairs": 240,
+  "seed": 42
+}

@@ -1,0 +1,40 @@
+{
+  "output": "/path/to/curation-run",
+  "schema_version": "1",
+  "prompt_version": "v2",
+  "fields": [
+    "visual_quality",
+    "clarity",
+    "exposure",
+    "color_cast",
+    "rendered_text",
+    "text_coverage",
+    "watermark",
+    "logo",
+    "visible_artifacts",
+    "scene_type"
+  ],
+  "inference_server": {
+    "environment": "/path/to/vllm-env",
+    "model_path": "/path/to/model",
+    "num_replicas": 2,
+    "engine_kwargs": {
+      "tensor_parallel_size": 1,
+      "mm_encoder_tp_mode": "data",
+      "max_model_len": 8192,
+      "max_num_seqs": 512
+    },
+    "env_vars": {
+      "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+      "VLLM_USE_RUST_FRONTEND": "1"
+    }
+  },
+  "batch_size": 32,
+  "reader_workers": 4,
+  "reader_gpus_per_worker": 0.25,
+  "annotation_workers": 64,
+  "requests_per_worker": 8,
+  "num_cpus": 80,
+  "num_gpus": 3,
+  "input_run": "/path/to/curation-run"
+}

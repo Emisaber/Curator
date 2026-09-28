@@ -360,6 +360,18 @@ navigation:
               - page: Deduplication Workflow
                 path: ./v26.07/pages/curate-images/tutorials/dedup-workflow.mdx
                 slug: dedup-workflow
+              - page: T2I Data Pipeline
+                path: ./v26.07/pages/curate-images/tutorials/t2i-pipeline.mdx
+                slug: t2i-pipeline
+              - page: Compare Deduplication Candidates
+                path: ./v26.07/pages/curate-images/tutorials/dedup-comparison.mdx
+                slug: dedup-comparison
+              - page: Shard Subsets and Caption-aware Deduplication
+                path: ./v26.07/pages/curate-images/tutorials/shard-subset.mdx
+                slug: shard-subset
+              - page: NSFW and HPSv3 Annotations
+                path: ./v26.07/pages/curate-images/tutorials/image-score-annotations.mdx
+                slug: image-score-annotations
           - section: Load Data
             slug: load-data
             contents:

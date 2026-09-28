@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图像去重 · 人工检查</title>
+<style>
+:root{color-scheme:light;--ink:#19212c;--muted:#667181;--line:#e0e5ea;--blue:#265bb0}
+*{box-sizing:border-box}body{margin:0;background:#f7f8fa;color:var(--ink);font:14px/1.6 system-ui,sans-serif}
+header,main{max-width:1440px;margin:auto;padding:24px 32px}header{padding-bottom:8px}
+h1{font-size:26px;font-weight:600;letter-spacing:-.7px;margin:0}p{color:var(--muted);max-width:1050px}
+.summary{display:flex;flex-wrap:wrap;gap:12px;margin:20px 0}.metric{background:white;border:1px solid var(--line);border-radius:10px;padding:12px 22px}.metric strong{font-size:24px;display:block}
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0}
+button,select,input::file-selector-button{font:inherit;border:1px solid var(--line);border-radius:6px;padding:7px 12px;background:white;color:var(--ink);cursor:pointer}button:hover{border-color:var(--blue)}
+button:disabled{opacity:.4;cursor:default}input[type=file]{max-width:240px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.card{padding:16px;border:1px solid var(--line);border-radius:12px;background:white}
+.pictures{display:grid;grid-template-columns:1fr 1fr;gap:8px}.pictures button{padding:0;border:0;overflow:hidden;background:#f3f4f6}
+.pictures img{display:block;width:100%;height:240px;object-fit:contain}
+.meta{font-size:12px;color:var(--muted);overflow-wrap:anywhere}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.tag{font-size:11px;letter-spacing:.4px;color:var(--blue)}details{margin-top:10px}summary{cursor:pointer;color:var(--muted)}
+.related{display:flex;gap:8px;overflow:auto;margin-top:12px}.related img{width:72px;height:64px;object-fit:contain}.related a{flex-shrink:0}
+dialog{width:96vw;max-width:1800px;border:1px solid var(--line);border-radius:10px;padding:18px}
+dialog::backdrop{background:#152033b3}.originals{display:grid;grid-template-columns:1fr 1fr;gap:12px}.viewport{overflow:auto;height:72vh;background:#f2f3f5}.viewport img{display:block;max-width:100%;max-height:100%;margin:auto;object-fit:contain}.pixel .viewport img{max-width:none;max-height:none;margin:0}
+a{color:var(--blue)}#status{margin-left:auto;color:var(--muted)}.empty{padding:60px;text-align:center;color:var(--muted)}
+@media(max-width:850px){.grid{grid-template-columns:1fr}header,main{padding:16px}.pictures img{height:200px}}
+</style>
+</head>
+<body>
+<header>
+<h1>图像去重 / 人工检查</h1>
+<p>先判断图像关系与清晰度，再展开算法分数。缩略图只用于浏览，点击进入原图并切换 100%。
+“仅 pHash”表示未被本次 CLIP workflow 标为重复，不代表全局 CLIP 相似度低。
+CLIP 的箭头是原始候选方向，目标图也可能被其他候选标记，不等同于最终保留图。</p>
+<div class="summary" id="summary"></div>
+<div class="toolbar">
+<select id="filter" aria-label="筛选例子"><option value="all">全部例子</option><option value="phash_random">pHash 随机命中</option><option value="clip_random">CLIP 随机命中</option><option value="phash_only">仅 pHash</option><option value="clip_only">仅 CLIP</option><option value="phash_boundary">pHash 阈值附近</option><option value="clip_boundary">CLIP 阈值附近</option><option value="unreviewed">尚未判断</option></select>
+<button id="export">导出人工标注 JSON</button><label>导入 <input type="file" id="import" accept=".json"></label><span id="status"></span>
+</div>
+<p class="meta" id="config"></p>
+<p class="meta" id="precision"></p>
+</header>
+<main><div class="toolbar"><button id="prev">上一页</button><span id="page"></span><button id="next">下一页</button></div><div class="grid" id="grid"></div>
+<p>随机命中子集用于估计命中准确性；分歧、边界和补充例子用于定位问题，不能混在一起估计总体准确率。这份报告不能估计漏检率，也不执行图像删除。</p>
+</main>
+<dialog id="viewer"><div class="toolbar"><strong>原始图像</strong><button id="scale">切换 100% / 适应窗口</button><button id="close">关闭</button></div><div class="originals" id="originals"></div></dialog>
+<script src="data.js"></script>
+<script>
+const {pairs,images,stats,run}=window.REVIEW;
+const hasPhash=run.mode!=="clip",hasClip=run.mode!=="phash";
+const $=id=>document.getElementById(id);
+const storageKey="dedup-review:"+run.output;
+let labels={},page=0;
+try{labels=JSON.parse(localStorage.getItem(storageKey)||"{}")}catch{ $("status").textContent="浏览器存储不可用，请导出标注保存"; }
+const key=p=>p.id_a+":"+p.id_b;
+const imageGroups=new Map();for(const p of pairs){imageGroups.set(p.id_a,p.group_a);imageGroups.set(p.id_b,p.group_b)}
+const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
+for(const [name,value] of [["可解码图像",stats.decoded],["解码失败",stats.decode_failures],["pHash 命中对",hasPhash?stats.phash_hit_pairs:"未运行"],["CLIP 命中对",hasClip?stats.clip_hit_pairs:"未运行"],["CLIP 拟移除 ID",hasClip?stats.clip_duplicate_ids:"未运行"],["人工检查对",pairs.length]]){
+ const n=el("div",name,"metric");n.append(el("strong",String(value)));$("summary").append(n);
+}
+$("config").textContent="模式 "+run.mode+" · "+(hasPhash?"pHash ≤ "+run.phash_threshold:"pHash 未运行")+" · "+(hasClip?"CLIP ≥ 0.99（原生 float16） · 聚类 "+run.n_clusters:"CLIP 未运行；本报告不能用于两种方法的对比")+" · seed "+run.seed;
+function save(){try{localStorage.setItem(storageKey,JSON.stringify(labels));$("status").textContent="已判断 "+Object.values(labels).filter(x=>x.relation).length+" / "+pairs.length}catch{$("status").textContent="请导出标注保存"}
+ const summaries=[];
+ for(const cohort of ["phash_random","clip_random"]){if((cohort==="phash_random"&&!hasPhash)||(cohort==="clip_random"&&!hasClip))continue;const all=pairs.filter(p=>p.cohorts.includes(cohort)),judged=all.map(p=>labels[key(p)]?.relation).filter(x=>x&&x!=="uncertain");
+ const confirmed=judged.filter(x=>x==="identical"||x==="variant").length;
+ summaries.push(cohort+"：已明确判断 "+judged.length+" / "+all.length+"，同图或变体 "+confirmed+" / "+judged.length+(judged.length?"（"+(100*confirmed/judged.length).toFixed(1)+"%）":""));}
+ $("precision").textContent=summaries.join(" · ")+"。比例仅针对已明确判断的随机子集；未判断及不确定项不计入分母。";
+}
+function showOriginal(p){
+ $("originals").replaceChildren();$("viewer").classList.remove("pixel");
+ for(const id of [p.id_a,p.id_b]){
+  const data=images[id],column=el("div");column.append(el("p",data.source+" · "+data.width+" × "+data.height+" · "+data.member,"meta"));
+  const view=el("div",undefined,"viewport"),img=el("img");img.src=data.original;img.alt=data.member;
+  const zoom=el("select");zoom.className="zoom";zoom.setAttribute("aria-label","原图缩放");
+  for(const [value,text] of [["fit","适应窗口"],["50","50%"],["100","100%"],["200","200%"],["400","400%"]]){const opt=el("option",text);opt.value=value;zoom.append(opt)}
+  zoom.onchange=()=>{img.style.maxWidth=zoom.value==="fit"?"100%":"none";img.style.maxHeight=zoom.value==="fit"?"100%":"none";img.style.width=zoom.value==="fit"?"auto":(data.width*Number(zoom.value)/100)+"px";img.style.margin=zoom.value==="fit"?"auto":"0"};
+  column.append(zoom);view.append(img);column.append(view);
+  const link=el("a","单独打开原图");link.href=data.original;link.target="_blank";column.append(link);$("originals").append(column);
+  const related=el("div",undefined,"related");
+  for(const [other,group] of imageGroups)if(other!==id&&group===imageGroups.get(id)){
+   const link=el("a"),preview=el("img");link.href=images[other].original;link.target="_blank";preview.src=images[other].preview;preview.alt=images[other].member;preview.loading="lazy";link.append(preview);related.append(link);
+  }
+  column.append(el("div","本次报告中同组图像 · 候选连通关系不代表任意两图相同","meta"),related);
+ }
+ $("viewer").showModal();
+}
+function choice(p,field,options){
+ const select=el("select");select.setAttribute("aria-label",field==="relation"?"图像关系":"清晰度");
+ for(const [value,text] of options){const opt=el("option",text);opt.value=value;select.append(opt)}
+ select.value=(labels[key(p)]||{})[field]||"";
+ select.onchange=()=>{labels[key(p)]={...labels[key(p)],[field]:select.value};save()};
+ return select;
+}
+function render(){
+ const f=$("filter").value;
+ const visible=pairs.filter(p=>f==="all"||(f==="unreviewed"?!labels[key(p)]?.relation:p.cohorts.includes(f)));
+ const pages=Math.max(1,Math.ceil(visible.length/12));page=Math.min(page,pages-1);$("grid").replaceChildren();
+ $("page").textContent=(page+1)+" / "+pages+" · "+visible.length+" 对";$("prev").disabled=page===0;$("next").disabled=page===pages-1;
+ for(const p of visible.slice(page*12,(page+1)*12)){
+  const card=el("article",undefined,"card");card.append(el("div",p.cohorts.join(" · "),"tag"));
+  const pics=el("div",undefined,"pictures");
+  for(const [i,id] of [p.id_a,p.id_b].entries()){
+   const data=images[id],column=el("div"),button=el("button"),img=el("img");
+   img.src=data.preview;img.loading="lazy";img.alt=data.member;button.append(img);button.onclick=()=>showOriginal(p);
+   column.append(button,el("div",(i?"B":"A")+" · "+data.source+" · "+data.width+" × "+data.height,"meta"));pics.append(column);
+  }
+  card.append(pics);
+  const row=el("div",undefined,"row");
+  row.append(choice(p,"relation",[["","图像关系…"],["identical","同一图像"],["variant","同一内容的变体"],["different","不同图像"],["uncertain","无法确定"]]),
+   choice(p,"clarity",[["","清晰度…"],["a","A 更清晰"],["b","B 更清晰"],["same","无明显差异"],["incomparable","不适合比较"]]));
+  card.append(row);
+  const detail=el("details");detail.append(el("summary","查看算法分数与来源"));
+  const score=p.clip_score===null?"无原生候选":p.clip_score.toFixed(6);
+  detail.append(el("div",(hasPhash?"pHash: "+p.hamming_distance+" · "+(p.phash_hit?"命中":"未命中"):"pHash 未运行")+" | "+(hasClip?"CLIP: "+score+" · "+(p.clip_hit?"命中":"未命中"):"CLIP 未运行"),"meta"));
+  if(p.clip_from)detail.append(el("div","原生方向："+(p.clip_from===p.id_a?"A → B":"B → A"),"meta"));
+  const reasons={matched:"原生命中",below_threshold:"原生分数低于阈值",cross_cluster:"不同聚类",not_best_match:"同簇，但该图对未被选为最佳参照",not_run:"未运行"};
+  if(hasClip)detail.append(el("div","CLIP："+reasons[p.clip_status]+" · 拟移除 ID：A "+(p.clip_removed_a?"是":"否")+" / B "+(p.clip_removed_b?"是":"否"),"meta"));
+  if(p.clip_diagnostic!==null)detail.append(el("div","补算 float32 CLIP: "+p.clip_diagnostic.toFixed(6)+"（仅诊断，不替代原生结果）","meta"));
+  for(const id of [p.id_a,p.id_b])detail.append(el("div",images[id].source+" / "+images[id].shard+" / "+images[id].member,"meta"));
+  card.append(detail);$("grid").append(card);
+ }
+ if(!visible.length)$("grid").append(el("div","没有符合条件的候选对。","empty"));
+}
+$("filter").onchange=()=>{page=0;render()};
+$("prev").onclick=()=>{page--;render()};$("next").onclick=()=>{page++;render()};
+$("close").onclick=()=>$("viewer").close();$("scale").onclick=()=>{const selects=[...document.querySelectorAll(".zoom")],value=selects.every(x=>x.value==="100")?"fit":"100";for(const select of selects){select.value=value;select.onchange()}};
+$("export").onclick=()=>{
+ const entries=pairs.filter(p=>labels[key(p)]).map(p=>({id_a:p.id_a,id_b:p.id_b,cohorts:p.cohorts,...labels[key(p)]}));
+ const url=URL.createObjectURL(new Blob([JSON.stringify({run,entries},null,2)],{type:"application/json"}));
+ const link=el("a");link.href=url;link.download="review-labels.json";link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+$("import").onchange=async e=>{
+ try{const data=JSON.parse(await e.target.files[0].text()),valid=new Set(pairs.map(key));
+ for(const entry of data.entries)if(valid.has(key(entry)))labels[key(entry)]={relation:entry.relation,clarity:entry.clarity};save();render()}
+ catch{$("status").textContent="无法读取标注文件"}
+};
+render();save();
+</script>
+</body></html>
